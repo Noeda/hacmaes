@@ -5,14 +5,20 @@
 using namespace libcmaes;
 
 extern "C" {
-    void cmaes_optimize(double* initial, double sigma, double lambda, uint64_t num_coords, double (*evaluate)(double*, int*));
+    void cmaes_optimize(double* initial, double sigma, int lambda, uint64_t num_coords, double (*evaluate)(double*, int*), void (*iterator)(void));
 }
 
-void cmaes_optimize(double* initial, double sigma, double lambda, uint64_t num_coords, double (*evaluate)(double*, int*))
+void cmaes_optimize(double* initial, double sigma, int lambda, uint64_t num_coords, double (*evaluate)(double*, int*), void (*iter)(void))
 {
     FitFunc fit = [&evaluate](const double* params, const int N) {
         int dumb = 0;
         return evaluate(const_cast<double*>(params), &dumb);
+    };
+
+    ProgressFunc<CMAParameters<>,CMASolutions> pfunc = [&iter](const CMAParameters<> &cmaparams, const CMASolutions &cmasolutions)
+    {
+        iter();
+        return 0;
     };
 
     std::vector<double> x0;
@@ -20,9 +26,9 @@ void cmaes_optimize(double* initial, double sigma, double lambda, uint64_t num_c
         x0.push_back(initial[i1]);
     }
 
-    CMAParameters<> cmaparams(x0, sigma);
+    CMAParameters<> cmaparams(x0, sigma, lambda);
     cmaparams.set_algo(aCMAES);
-    CMASolutions cmasols = cmaes<>(fit, cmaparams);
+    CMASolutions cmasols = cmaes<>(fit, cmaparams, pfunc);
     cmasols.sort_candidates();
     std::vector<double> out = cmasols.best_candidate().get_x();
 
