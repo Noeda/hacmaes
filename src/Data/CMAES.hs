@@ -28,7 +28,7 @@ toBase archetype lst = flip evalState lst $ for archetype $ \_ -> do
   return x
 {-# INLINE toBase #-}
 
-cmaesOptimize :: Traversable f => f Double -> Double -> Int -> (f Double -> IO Double) -> IO ()
+cmaesOptimize :: Traversable f => f Double -> Double -> Int -> (f Double -> IO Double) -> IO (f Double)
 cmaesOptimize initial_value sigma lambda evaluator = mask $ \restore -> do
   is_dead <- newIORef False
   wrapping <- mkEvaluate $ \test_arr dead_poker -> do
@@ -47,6 +47,9 @@ cmaesOptimize initial_value sigma lambda evaluator = mask $ \restore -> do
                freeHaskellFunPtr wrapping
                putMVar done ()
       restore $ takeMVar done
+
+      lst <- peekArray num_values initial_value_arr
+      return $ toBase initial_value $ coerce lst
  where
   initial_value_list = toList initial_value
   num_values = length initial_value_list

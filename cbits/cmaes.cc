@@ -23,5 +23,11 @@ void cmaes_optimize(double* initial, double sigma, double lambda, uint64_t num_c
     CMAParameters<> cmaparams(x0, sigma);
     cmaparams.set_algo(aCMAES);
     CMASolutions cmasols = cmaes<>(fit, cmaparams);
+    cmasols.sort_candidates();
+    std::vector<double> out = cmasols.best_candidate().get_x();
+
+    for ( uint64_t i1 = 0; i1 < num_coords; ++i1 ) {
+        initial[i1] = out[i1];
+    }
 }
 
