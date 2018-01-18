@@ -1,5 +1,5 @@
 #include <vector>
-#include "cmaes.h"
+#include "libcmaes/cmaes.h"
 #include <stdint.h>
 
 using namespace libcmaes;

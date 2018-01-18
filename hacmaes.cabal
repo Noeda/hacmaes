@@ -12,6 +12,8 @@ library
   exposed-modules:     Data.CMAES
   build-depends:       base >=4.6 && <5.0
                       ,mwc-random
+                      ,primitive
+                      ,stm
                       ,transformers
   hs-source-dirs:      src
   ghc-options:         -Wall -fno-warn-name-shadowing

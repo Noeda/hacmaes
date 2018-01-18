@@ -1,24 +1,34 @@
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE LambdaCase #-}
+
 module Data.CMAES
   ( cmaesOptimize
+  , cmaesOptimizeList
   , randomOptimize )
   where
 
 import Control.Concurrent
+import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
+import Control.Monad.IO.Class
+import Control.Monad.Primitive
 import Control.Monad.Trans.State.Strict
 import Data.Coerce
 import Data.Foldable
 import Data.List ( sortBy )
+import Data.Maybe
 import Data.Ord ( comparing )
 import Data.IORef
 import Data.Traversable
 import Data.Word
 import Foreign.C.Types
 import Foreign.Marshal.Array
+import Foreign.Marshal.Utils
+import Foreign.ForeignPtr
 import Foreign.Ptr
 import Foreign.Storable
-import System.IO.Unsafe ( unsafePerformIO )
+import System.IO.Unsafe ( unsafePerformIO, unsafeInterleaveIO )
 import System.Random.MWC
 import System.Random.MWC.Distributions
 
@@ -71,6 +81,85 @@ cmaesOptimize initial_value sigma lambda evaluator iterator = mask $ \restore ->
  where
   initial_value_list = toList initial_value
   num_values = length initial_value_list
+
+-- | Returns a lazy list of successively tested models.
+--
+-- The list is not guaranteed (and typically) will not be in increasing order
+-- of fitness because of the nature of CMA-ES.
+cmaesOptimizeList :: (MonadIO m, Traversable f)
+                  => f Double  -- ^ Initial model
+                  -> Double    -- ^ Sigma
+                  -> Int       -- ^ Lambda
+                  -> (f Double -> IO Double)  -- ^ Evaluate score of a model
+                  -> m [f Double]
+cmaesOptimizeList initial_value sigma lambda evaluator = liftIO $ mask_ $ do
+  is_dead <- newIORef False
+  lst_mvar <- newTVarIO Nothing
+  exc_ref <- newTVarIO Nothing
+  last <- newTVarIO False
+  wrapping <- mkEvaluate $ \test_arr dead_poker -> do
+    dead <- readIORef is_dead
+    if dead
+      then do poke dead_poker 1
+              return 0.0
+      else try (do lst <- peekArray num_values test_arr
+                   let strut = toBase initial_value $ coerce lst
+
+                   atomically $ do
+                     old <- readTVar lst_mvar
+                     when (isJust old) retry
+                     writeTVar lst_mvar (Just strut)
+
+                   fmap CDouble $ evaluator strut) >>= \case
+             Left (exc :: SomeException) -> do
+               poke dead_poker 1
+               writeIORef is_dead True
+               atomically $ writeTVar exc_ref $ Just exc
+               return 0.0
+             Right ok -> return ok
+
+  wrapping2 <- mkIterate $ return ()
+
+  farr <- mallocForeignPtrArray (length initial_value_list)
+  withForeignPtr farr $ \farr_ptr ->
+    withArray initial_value_list $ \initial_value_arr ->
+      copyBytes farr_ptr initial_value_arr (length initial_value_list * sizeOf (undefined :: Double))
+
+  finalizer <- newMVar ()
+  withForeignPtr farr $ \farr_ptr ->
+    void $ forkIO $ do
+             cmaes_optimize (castPtr farr_ptr) (CDouble sigma) (fromIntegral lambda) (fromIntegral num_values) wrapping wrapping2
+             freeHaskellFunPtr wrapping
+             freeHaskellFunPtr wrapping2
+             atomically $ writeTVar last True
+  void $ mkWeakMVar finalizer $ do
+    writeIORef is_dead True
+    atomically $ writeTVar lst_mvar Nothing
+
+  unsafeInterleaveIO $ go exc_ref lst_mvar finalizer farr last
+ where
+  initial_value_list = toList initial_value
+  num_values = length initial_value_list
+
+  go exc_ref lst_mvar finalizer farr last = do
+    next <- atomically $ do
+      exc <- readTVar exc_ref
+      val <- readTVar lst_mvar
+      finished <- readTVar last
+      when (isNothing exc && isNothing val && not finished) retry
+      case val of
+        Just{} -> writeTVar lst_mvar Nothing
+        _ -> return ()
+      return (exc, val, finished)
+    case next of
+      (Just exc, _, _) -> throwIO exc
+      (Nothing, Just v', _) -> do
+        v <- evaluate v'
+        withMVar finalizer $ \unit -> touch unit
+        touchForeignPtr farr
+        (v:) <$> unsafeInterleaveIO (go exc_ref lst_mvar finalizer farr last)
+      (_, _, True) -> return []
+      (_, _, _) -> error "impossible."
 
 globalRng :: GenIO
 globalRng = unsafePerformIO createSystemRandom
