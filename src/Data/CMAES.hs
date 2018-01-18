@@ -5,6 +5,8 @@ module Data.CMAES
   ( cmaesOptimize
   , cmaesOptimizeList
   , cmaesOptimizeList'
+  , cmaesOptimizeListIt
+  , cmaesOptimizeListIt'
   , randomOptimize )
   where
 
@@ -83,28 +85,48 @@ cmaesOptimize initial_value sigma lambda evaluator iterator = mask $ \restore ->
   initial_value_list = toList initial_value
   num_values = length initial_value_list
 
-cmaesOptimizeList :: (MonadIO m, Traversable f)
-                  => f Double  -- ^ Initial model
-                  -> Double    -- ^ Sigma
-                  -> Int       -- ^ Lambda
-                  -> (f Double -> IO Double)  -- ^ Evaluate score of a model
-                  -> m [f Double]
-cmaesOptimizeList initial_value sigma lambda evaluator = do
-  lst <- cmaesOptimizeList' initial_value sigma lambda evaluator
-  return $ fmap snd lst
-{-# INLINE cmaesOptimizeList #-}
-
--- | Returns a lazy list of successively tested models.
---
--- The list is not guaranteed (and typically) will not be in increasing order
--- of fitness because of the nature of CMA-ES optimization.
 cmaesOptimizeList' :: (MonadIO m, Traversable f)
                    => f Double  -- ^ Initial model
                    -> Double    -- ^ Sigma
                    -> Int       -- ^ Lambda
                    -> (f Double -> IO Double)  -- ^ Evaluate score of a model
                    -> m [(Double, f Double)]
-cmaesOptimizeList' initial_value sigma lambda evaluator = liftIO $ mask_ $ do
+cmaesOptimizeList' initial_value sigma lambda evaluator = do
+  cmaesOptimizeListIt' initial_value sigma lambda evaluator (return ())
+
+cmaesOptimizeList :: (MonadIO m, Traversable f)
+                   => f Double  -- ^ Initial model
+                   -> Double    -- ^ Sigma
+                   -> Int       -- ^ Lambda
+                   -> (f Double -> IO Double)  -- ^ Evaluate score of a model
+                   -> m [f Double]
+cmaesOptimizeList initial_value sigma lambda evaluator = do
+  cmaesOptimizeListIt initial_value sigma lambda evaluator (return ())
+
+cmaesOptimizeListIt :: (MonadIO m, Traversable f)
+                    => f Double  -- ^ Initial model
+                    -> Double    -- ^ Sigma
+                    -> Int       -- ^ Lambda
+                    -> (f Double -> IO Double)  -- ^ Evaluate score of a model
+                    -> IO ()
+                    -> m [f Double]
+cmaesOptimizeListIt initial_value sigma lambda evaluator checker = do
+  lst <- cmaesOptimizeListIt' initial_value sigma lambda evaluator checker
+  return $ fmap snd lst
+{-# INLINE cmaesOptimizeListIt #-}
+
+-- | Returns a lazy list of successively tested models.
+--
+-- The list is not guaranteed (and typically) will not be in increasing order
+-- of fitness because of the nature of CMA-ES optimization.
+cmaesOptimizeListIt' :: (MonadIO m, Traversable f)
+                     => f Double  -- ^ Initial model
+                     -> Double    -- ^ Sigma
+                     -> Int       -- ^ Lambda
+                     -> (f Double -> IO Double)  -- ^ Evaluate score of a model
+                     -> IO ()                    -- ^ Called at the end of each round
+                     -> m [(Double, f Double)]
+cmaesOptimizeListIt' initial_value sigma lambda evaluator checker = liftIO $ mask_ $ do
   is_dead <- newIORef False
   lst_mvar <- newTVarIO Nothing
   exc_ref <- newTVarIO Nothing
@@ -131,7 +153,12 @@ cmaesOptimizeList' initial_value sigma lambda evaluator = liftIO $ mask_ $ do
                return 0.0
              Right ok -> return ok
 
-  wrapping2 <- mkIterate $ return ()
+  wrapping2 <- mkIterate $
+    try checker >>= \case
+      Left (exc :: SomeException) -> do
+        writeIORef is_dead True
+        atomically $ writeTVar exc_ref $ Just exc
+      Right _ -> return ()
 
   farr <- mallocForeignPtrArray (length initial_value_list)
   withForeignPtr farr $ \farr_ptr ->
@@ -140,7 +167,7 @@ cmaesOptimizeList' initial_value sigma lambda evaluator = liftIO $ mask_ $ do
 
   finalizer <- newMVar ()
   withForeignPtr farr $ \farr_ptr ->
-    void $ forkIO $ do
+    void $ forkIOWithUnmask $ \unmask -> unmask $ do
              cmaes_optimize (castPtr farr_ptr) (CDouble sigma) (fromIntegral lambda) (fromIntegral num_values) wrapping wrapping2
              freeHaskellFunPtr wrapping
              freeHaskellFunPtr wrapping2
