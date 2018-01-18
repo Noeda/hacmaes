@@ -4,6 +4,7 @@
 module Data.CMAES
   ( cmaesOptimize
   , cmaesOptimizeList
+  , cmaesOptimizeList'
   , randomOptimize )
   where
 
@@ -82,17 +83,28 @@ cmaesOptimize initial_value sigma lambda evaluator iterator = mask $ \restore ->
   initial_value_list = toList initial_value
   num_values = length initial_value_list
 
--- | Returns a lazy list of successively tested models.
---
--- The list is not guaranteed (and typically) will not be in increasing order
--- of fitness because of the nature of CMA-ES.
 cmaesOptimizeList :: (MonadIO m, Traversable f)
                   => f Double  -- ^ Initial model
                   -> Double    -- ^ Sigma
                   -> Int       -- ^ Lambda
                   -> (f Double -> IO Double)  -- ^ Evaluate score of a model
                   -> m [f Double]
-cmaesOptimizeList initial_value sigma lambda evaluator = liftIO $ mask_ $ do
+cmaesOptimizeList initial_value sigma lambda evaluator = do
+  lst <- cmaesOptimizeList' initial_value sigma lambda evaluator
+  return $ fmap snd lst
+{-# INLINE cmaesOptimizeList #-}
+
+-- | Returns a lazy list of successively tested models.
+--
+-- The list is not guaranteed (and typically) will not be in increasing order
+-- of fitness because of the nature of CMA-ES optimization.
+cmaesOptimizeList' :: (MonadIO m, Traversable f)
+                   => f Double  -- ^ Initial model
+                   -> Double    -- ^ Sigma
+                   -> Int       -- ^ Lambda
+                   -> (f Double -> IO Double)  -- ^ Evaluate score of a model
+                   -> m [(Double, f Double)]
+cmaesOptimizeList' initial_value sigma lambda evaluator = liftIO $ mask_ $ do
   is_dead <- newIORef False
   lst_mvar <- newTVarIO Nothing
   exc_ref <- newTVarIO Nothing
@@ -104,13 +116,14 @@ cmaesOptimizeList initial_value sigma lambda evaluator = liftIO $ mask_ $ do
               return 0.0
       else try (do lst <- peekArray num_values test_arr
                    let strut = toBase initial_value $ coerce lst
+                   value <- evaluator strut
 
                    atomically $ do
                      old <- readTVar lst_mvar
                      when (isJust old) retry
-                     writeTVar lst_mvar (Just strut)
+                     writeTVar lst_mvar (Just (value, strut))
 
-                   fmap CDouble $ evaluator strut) >>= \case
+                   return $ CDouble value) >>= \case
              Left (exc :: SomeException) -> do
                poke dead_poker 1
                writeIORef is_dead True
