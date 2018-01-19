@@ -11,7 +11,6 @@ cabal-version:       >=1.10
 library
   exposed-modules:     Data.CMAES
   build-depends:       base >=4.6 && <5.0
-                      ,mwc-random
                       ,primitive
                       ,stm
                       ,transformers

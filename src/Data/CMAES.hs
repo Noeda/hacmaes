@@ -1,13 +1,17 @@
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 
 module Data.CMAES
-  ( cmaesOptimize
-  , cmaesOptimizeList
+  ( cmaesOptimizeList
   , cmaesOptimizeList'
-  , cmaesOptimizeListIt
-  , cmaesOptimizeListIt'
-  , randomOptimize )
+  , defaultConfiguration
+  , defaultInit
+  , allAlgorithms
+  , CMAESInit(..)
+  , CMAESConfiguration(..) )
   where
 
 import Control.Concurrent
@@ -18,10 +22,9 @@ import Control.Monad.IO.Class
 import Control.Monad.Primitive
 import Control.Monad.Trans.State.Strict
 import Data.Coerce
+import Data.Data
 import Data.Foldable
-import Data.List ( sortBy )
 import Data.Maybe
-import Data.Ord ( comparing )
 import Data.IORef
 import Data.Traversable
 import Data.Word
@@ -31,13 +34,66 @@ import Foreign.Marshal.Utils
 import Foreign.ForeignPtr
 import Foreign.Ptr
 import Foreign.Storable
-import System.IO.Unsafe ( unsafePerformIO, unsafeInterleaveIO )
-import System.Random.MWC
-import System.Random.MWC.Distributions
+import GHC.Generics
+import System.IO.Unsafe
 
-foreign import ccall safe cmaes_optimize :: Ptr CDouble -> CDouble -> CInt -> Word64 -> FunPtr CEvaluator -> FunPtr CIterator -> IO ()
+foreign import ccall safe cmaes_optimize :: CInt -> CInt -> Ptr CDouble -> CDouble -> CInt -> Word64 -> FunPtr CEvaluator -> FunPtr CIterator -> IO ()
 foreign import ccall "wrapper" mkEvaluate :: CEvaluator -> IO (FunPtr CEvaluator)
 foreign import ccall "wrapper" mkIterate :: CIterator -> IO (FunPtr CIterator)
+
+foreign import ccall safe const_CMAES_DEFAULT :: CInt
+foreign import ccall safe const_IPOP_CMAES :: CInt
+foreign import ccall safe const_BIPOP_CMAES :: CInt
+foreign import ccall safe const_aCMAES :: CInt
+foreign import ccall safe const_aIPOP_CMAES :: CInt
+foreign import ccall safe const_aBIPOP_CMAES :: CInt
+foreign import ccall safe const_sepCMAES :: CInt
+foreign import ccall safe const_sepIPOP_CMAES :: CInt
+foreign import ccall safe const_sepBIPOP_CMAES :: CInt
+foreign import ccall safe const_sepaCMAES :: CInt
+foreign import ccall safe const_sepaIPOP_CMAES :: CInt
+foreign import ccall safe const_sepaBIPOP_CMAES :: CInt
+foreign import ccall safe const_VD_CMAES :: CInt
+foreign import ccall safe const_VD_IPOP_CMAES :: CInt
+foreign import ccall safe const_VD_BIPOP_CMAES :: CInt
+
+data CMAESAlgo
+  = CMAES_DEFAULT
+  | IPOP_CMAES
+  | BIPOP_CMAES
+  | ACMAES
+  | AIPOP_CMAES
+  | ABIPOP_CMAES
+  | SepCMAES
+  | SepIPOP_CMAES
+  | SepBIPOP_CMAES
+  | SepaCMAES
+  | SepaIPOP_CMAES
+  | SepaBIPOP_CMAES
+  | VD_CMAES
+  | VD_IPOP_CMAES
+  | VD_BIPOP_CMAES
+  deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic, Enum )
+
+allAlgorithms :: [CMAESAlgo]
+allAlgorithms = enumFromTo CMAES_DEFAULT VD_BIPOP_CMAES
+
+cmaesAlgoToCInt :: CMAESAlgo -> CInt
+cmaesAlgoToCInt CMAES_DEFAULT = const_CMAES_DEFAULT
+cmaesAlgoToCInt IPOP_CMAES = const_IPOP_CMAES
+cmaesAlgoToCInt BIPOP_CMAES = const_BIPOP_CMAES
+cmaesAlgoToCInt ACMAES = const_aCMAES
+cmaesAlgoToCInt AIPOP_CMAES = const_aIPOP_CMAES
+cmaesAlgoToCInt ABIPOP_CMAES = const_aBIPOP_CMAES
+cmaesAlgoToCInt SepCMAES = const_sepCMAES
+cmaesAlgoToCInt SepIPOP_CMAES = const_sepIPOP_CMAES
+cmaesAlgoToCInt SepBIPOP_CMAES = const_sepBIPOP_CMAES
+cmaesAlgoToCInt SepaCMAES = const_sepaCMAES
+cmaesAlgoToCInt SepaIPOP_CMAES = const_sepaIPOP_CMAES
+cmaesAlgoToCInt SepaBIPOP_CMAES = const_sepaBIPOP_CMAES
+cmaesAlgoToCInt VD_CMAES = const_VD_CMAES
+cmaesAlgoToCInt VD_IPOP_CMAES = const_VD_IPOP_CMAES
+cmaesAlgoToCInt VD_BIPOP_CMAES = const_VD_BIPOP_CMAES
 
 type CEvaluator = Ptr CDouble -> Ptr CInt -> IO CDouble
 type CIterator = IO ()
@@ -49,84 +105,56 @@ toBase archetype lst = flip evalState lst $ for archetype $ \_ -> do
   return x
 {-# INLINE toBase #-}
 
--- | Optimizes using CMA-ES algorithm.
-cmaesOptimize :: Traversable f
-              => f Double  -- ^ Initial model
-              -> Double    -- ^ Sigma
-              -> Int       -- ^ Lambda
-              -> (f Double -> IO Double)  -- ^ Evaluate score of a model
-              -> IO ()                    -- ^ Called once after each round
-              -> IO (f Double)            -- ^ Returns optimized model.
-cmaesOptimize initial_value sigma lambda evaluator iterator = mask $ \restore -> do
-  is_dead <- newIORef False
-  wrapping <- mkEvaluate $ \test_arr dead_poker -> do
-    dead <- readIORef is_dead
-    if dead
-      then do poke dead_poker 1
-              return 0.0
-      else do lst <- peekArray num_values test_arr
-              fmap CDouble $ evaluator $ toBase initial_value $ coerce lst
+data CMAESConfiguration = CMAESConfiguration
+  { sigma         :: !Double
+  , lambda        :: !Int
+  , algorithm     :: !CMAESAlgo
+  , useSurrogates :: !Bool }
+  deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic )
 
-  wrapping2 <- mkIterate iterator
+defaultConfiguration :: CMAESConfiguration
+defaultConfiguration = CMAESConfiguration
+  { sigma = 1
+  , lambda = 10
+  , algorithm = ACMAES
+  , useSurrogates = False }
 
-  flip finally (writeIORef is_dead True) $ do
-    withArray initial_value_list $ \initial_value_arr -> do
-      done <- newEmptyMVar
-      void $ forkIO $ do
-               cmaes_optimize (castPtr initial_value_arr) (CDouble sigma) (fromIntegral lambda) (fromIntegral num_values) wrapping wrapping2
-               freeHaskellFunPtr wrapping
-               freeHaskellFunPtr wrapping2
-               putMVar done ()
-      restore $ takeMVar done
+defaultInit :: f Double -> (f Double -> IO Double) -> CMAESInit f
+defaultInit init ev = CMAESInit
+  { iteration = return ()
+  , initialModel = init
+  , evaluator = ev }
 
-      lst <- peekArray num_values initial_value_arr
-      return $ toBase initial_value $ coerce lst
- where
-  initial_value_list = toList initial_value
-  num_values = length initial_value_list
-
-cmaesOptimizeList' :: (MonadIO m, Traversable f)
-                   => f Double  -- ^ Initial model
-                   -> Double    -- ^ Sigma
-                   -> Int       -- ^ Lambda
-                   -> (f Double -> IO Double)  -- ^ Evaluate score of a model
-                   -> m [(Double, f Double)]
-cmaesOptimizeList' initial_value sigma lambda evaluator = do
-  cmaesOptimizeListIt' initial_value sigma lambda evaluator (return ())
-
-cmaesOptimizeList :: (MonadIO m, Traversable f)
-                   => f Double  -- ^ Initial model
-                   -> Double    -- ^ Sigma
-                   -> Int       -- ^ Lambda
-                   -> (f Double -> IO Double)  -- ^ Evaluate score of a model
-                   -> m [f Double]
-cmaesOptimizeList initial_value sigma lambda evaluator = do
-  cmaesOptimizeListIt initial_value sigma lambda evaluator (return ())
-
-cmaesOptimizeListIt :: (MonadIO m, Traversable f)
-                    => f Double  -- ^ Initial model
-                    -> Double    -- ^ Sigma
-                    -> Int       -- ^ Lambda
-                    -> (f Double -> IO Double)  -- ^ Evaluate score of a model
-                    -> IO ()
-                    -> m [f Double]
-cmaesOptimizeListIt initial_value sigma lambda evaluator checker = do
-  lst <- cmaesOptimizeListIt' initial_value sigma lambda evaluator checker
-  return $ fmap snd lst
-{-# INLINE cmaesOptimizeListIt #-}
+data CMAESInit f = CMAESInit
+  { initialModel :: !(f Double)
+  , iteration    :: !(IO ())
+  , evaluator    :: !(f Double -> IO Double) }
+  deriving ( Typeable, Generic )
 
 -- | Returns a lazy list of successively tested models.
 --
 -- The list is not guaranteed (and typically) will not be in increasing order
 -- of fitness because of the nature of CMA-ES optimization.
-cmaesOptimizeListIt' :: (MonadIO m, Traversable f)
-                     => f Double  -- ^ Initial model
-                     -> Double    -- ^ Sigma
-                     -> Int       -- ^ Lambda
-                     -> (f Double -> IO Double)  -- ^ Evaluate score of a model
-                     -> IO ()                    -- ^ Called at the end of each round
-                     -> m [(Double, f Double)]
-cmaesOptimizeListIt' initial_value sigma lambda evaluator checker = liftIO $ mask_ $ do
+cmaesOptimizeList :: (MonadIO m, Traversable f)
+                  => CMAESInit f
+                  -> CMAESConfiguration
+                  -> m [f Double]
+cmaesOptimizeList cmaes_init cmaes_conf = do
+  lst <- cmaesOptimizeList' cmaes_init cmaes_conf
+  return $ fmap snd lst
+{-# INLINE cmaesOptimizeList #-}
+
+-- | Returns a lazy list of successively tested models.
+--
+-- The list is not guaranteed (and typically) will not be in increasing order
+-- of fitness because of the nature of CMA-ES optimization.
+--
+-- This variation also returns the measured fitnesses of each tested model.
+cmaesOptimizeList' :: (MonadIO m, Traversable f)
+                   => CMAESInit f
+                   -> CMAESConfiguration
+                   -> m [(Double, f Double)]
+cmaesOptimizeList' cmaes_init cmaes_conf = liftIO $ mask_ $ do
   is_dead <- newIORef False
   lst_mvar <- newTVarIO Nothing
   exc_ref <- newTVarIO Nothing
@@ -137,8 +165,8 @@ cmaesOptimizeListIt' initial_value sigma lambda evaluator checker = liftIO $ mas
       then do poke dead_poker 1
               return 0.0
       else try (do lst <- peekArray num_values test_arr
-                   let strut = toBase initial_value $ coerce lst
-                   value <- evaluator strut
+                   let strut = toBase (initialModel cmaes_init) $ coerce lst
+                   value <- evaluator cmaes_init strut
 
                    atomically $ do
                      old <- readTVar lst_mvar
@@ -168,7 +196,7 @@ cmaesOptimizeListIt' initial_value sigma lambda evaluator checker = liftIO $ mas
   finalizer <- newMVar ()
   withForeignPtr farr $ \farr_ptr ->
     void $ forkIOWithUnmask $ \unmask -> unmask $ do
-             cmaes_optimize (castPtr farr_ptr) (CDouble sigma) (fromIntegral lambda) (fromIntegral num_values) wrapping wrapping2
+             cmaes_optimize use_surrogates algo (castPtr farr_ptr) (CDouble $ sigma cmaes_conf) (fromIntegral $ lambda cmaes_conf) (fromIntegral num_values) wrapping wrapping2
              freeHaskellFunPtr wrapping
              freeHaskellFunPtr wrapping2
              atomically $ writeTVar last True
@@ -178,7 +206,11 @@ cmaesOptimizeListIt' initial_value sigma lambda evaluator checker = liftIO $ mas
 
   unsafeInterleaveIO $ go exc_ref lst_mvar finalizer farr last
  where
-  initial_value_list = toList initial_value
+  use_surrogates = if useSurrogates cmaes_conf then 1 else 0
+  algo = cmaesAlgoToCInt (algorithm cmaes_conf)
+  checker = iteration cmaes_init
+
+  initial_value_list = toList $ initialModel cmaes_init
   num_values = length initial_value_list
 
   go exc_ref lst_mvar finalizer farr last = do
@@ -200,45 +232,4 @@ cmaesOptimizeListIt' initial_value sigma lambda evaluator checker = liftIO $ mas
         (v:) <$> unsafeInterleaveIO (go exc_ref lst_mvar finalizer farr last)
       (_, _, True) -> return []
       (_, _, _) -> error "impossible."
-
-globalRng :: GenIO
-globalRng = unsafePerformIO createSystemRandom
-{-# NOINLINE globalRng #-}
-
-makePerturbed :: Traversable f => f Double -> Double -> IO (f Double)
-makePerturbed model sigma = for model $ \value -> do
-  perturbing <- normal 0.0 sigma globalRng
-  return $ value + perturbing
-{-# INLINE makePerturbed #-}
-
--- | Optimizes using a very simple random walk algorithm.
---
--- This can be used as a baseline to compare between non-smart but working
--- optimizer against CMA-ES.
---
--- The type signature is deliberately exactly the same as in `cmaesOptimize`.
-randomOptimize :: Traversable f
-               => f Double
-               -> Double
-               -> Int
-               -> (f Double -> IO Double)
-               -> IO ()
-               -> IO (f Double)
-randomOptimize initial_model sigma lambda evaluator iterator = do
-  score <- evaluator initial_model
-  loop_it initial_model score
- where
-  loop_it initial_model score = do
-    descendants <- replicateM lambda $ makePerturbed initial_model sigma
-    descendants_score <- for descendants $ \descendant -> do
-      score <- evaluator descendant
-      return (descendant, score)
-
-    let (best_descendant, best_descendant_score) = head $ sortBy (comparing snd) descendants_score
-
-    iterator
-
-    if best_descendant_score < score
-      then loop_it best_descendant best_descendant_score
-      else loop_it initial_model score
 

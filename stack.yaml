@@ -66,6 +66,7 @@ extra-include-dirs:
     - /usr/local/include/libcmaes
     - /usr/local/include/eigen3
     - /usr/include/eigen3
+    - /usr/include/libcmaes
 extra-lib-dirs:
     - /usr/local/lib
 
