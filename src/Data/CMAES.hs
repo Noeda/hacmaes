@@ -10,6 +10,7 @@ module Data.CMAES
   , defaultConfiguration
   , defaultInit
   , allAlgorithms
+  , lambdaSuggestion
   , CMAESAlgo(..)
   , CMAESInit(..)
   , CMAESConfiguration(..) )
@@ -233,4 +234,9 @@ cmaesOptimizeList' cmaes_init cmaes_conf = liftIO $ mask_ $ do
         (v:) <$> unsafeInterleaveIO (go exc_ref lst_mvar finalizer farr last)
       (_, _, True) -> return []
       (_, _, _) -> error "impossible."
+
+lambdaSuggestion :: Traversable f => f a -> Int
+lambdaSuggestion model =
+  let num_params = length $ toList model
+   in 4 + floor (3 * log (fromIntegral num_params :: Double))
 
