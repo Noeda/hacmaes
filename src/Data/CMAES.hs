@@ -10,6 +10,7 @@ module Data.CMAES
   , defaultConfiguration
   , defaultInit
   , allAlgorithms
+  , CMAESAlgo(..)
   , CMAESInit(..)
   , CMAESConfiguration(..) )
   where
