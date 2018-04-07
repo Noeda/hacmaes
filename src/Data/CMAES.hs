@@ -11,6 +11,7 @@ module Data.CMAES
   , defaultInit
   , allAlgorithms
   , lambdaSuggestion
+  , pickBest
   , CMAESAlgo(..)
   , CMAESInit(..)
   , CMAESConfiguration(..) )
@@ -145,6 +146,23 @@ cmaesOptimizeList cmaes_init cmaes_conf = do
   lst <- cmaesOptimizeList' cmaes_init cmaes_conf
   return $ fmap snd lst
 {-# INLINE cmaesOptimizeList #-}
+
+-- | Combinator designed to use with cmaesOptimizeList' to pick out the best
+-- candidate.
+pickBest :: (Monad m, Ord score)
+         => m [(score, candidate)]
+         -> m candidate
+pickBest list_of_candidates = do
+  lst <- list_of_candidates
+  when (null lst) $
+    error "pickBest: no candidates."
+  return $ snd $ go (tail lst) (head lst)
+ where
+  go [] best = best
+  go ((candidate_score, candidate):rest) (best_score_yet, best_candidate) =
+    if candidate_score < best_score_yet
+      then go rest (candidate_score, candidate)
+      else go rest (best_score_yet, best_candidate)
 
 -- | Returns a lazy list of successively tested models.
 --
