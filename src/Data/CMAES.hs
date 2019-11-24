@@ -2,23 +2,29 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 
 module Data.CMAES
-  ( cmaesOptimizeList
+  (
+  -- * Functions that return lazy lists of models that get better
+    cmaesOptimizeList
   , cmaesOptimizeList'
+  , cmaesOptimizeListWithBatches
+  , pickBest
+  -- * Configuring how to run CMA-ES
   , defaultConfiguration
   , defaultInit
-  , allAlgorithms
-  , lambdaSuggestion
-  , pickBest
+  -- ** Types
   , CMAESAlgo(..)
+  , allAlgorithms
   , CMAESInit(..)
   , CMAESConfiguration(..)
   )
 where
 
 import           Control.Concurrent
+import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Exception
 import           Control.Monad
@@ -29,6 +35,8 @@ import           Data.Coerce
 import           Data.Data
 import           Data.Foldable
 import           Data.Maybe
+import qualified Data.Sequence                 as Seq
+import           Data.Sequence                  ( Seq )
 import           Data.IORef
 import           Data.Traversable
 import           Data.Word
@@ -79,6 +87,7 @@ data CMAESAlgo
   | VD_BIPOP_CMAES
   deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic, Enum )
 
+-- | List of all `CMAESAlgo` values.
 allAlgorithms :: [CMAESAlgo]
 allAlgorithms = enumFromTo CMAES_DEFAULT VD_BIPOP_CMAES
 
@@ -114,6 +123,7 @@ toBase archetype lst = flip evalState lst $ for archetype $ \_ -> do
         "toBase: size of Traversable and list do not match, ran out of Traversable."
 {-# INLINE toBase #-}
 
+-- | Configuration of CMA-ES algorithm.
 data CMAESConfiguration = CMAESConfiguration
   { sigma         :: !Double
   , lambda        :: !Int
@@ -133,9 +143,10 @@ defaultInit init ev =
   CMAESInit { iteration = return (), initialModel = init, evaluator = ev }
 
 data CMAESInit f = CMAESInit
-  { initialModel :: !(f Double)
-  , iteration    :: !(IO ())
-  , evaluator    :: !(f Double -> IO Double) }
+  { initialModel :: !(f Double)   -- ^ The first model.
+  , iteration    :: !(IO ())      -- ^ Called each time a new population is generated.
+  , evaluator    :: !(f Double -> IO Double) -- ^ Evaluate fitness of a model with this.
+  }
   deriving ( Typeable, Generic )
 
 -- | Returns a lazy list of successively tested models.
@@ -152,8 +163,122 @@ cmaesOptimizeList cmaes_init cmaes_conf = do
   return $ fmap snd lst
 {-# INLINE cmaesOptimizeList #-}
 
--- | Combinator designed to use with cmaesOptimizeList' to pick out the best
+data KillSilently = KillSilently
+  deriving ( Show, Eq, Ord )
+
+instance Exception KillSilently
+
+-- | Alternative formulation of `cmaesOptimizeList`.
+--
+-- This function has a concept of batches. Imagine you are training a network
+-- on huge amounts of data, more than we can load in the process. You can, at
+-- each training batch, load randomly some part of this huge load of data.
+-- CMA-ES will evaluate population on the same batch and then rank them. After
+-- that, we get a new batch.
+--
+-- This is implemented in terms of `cmaesOptimizeList`.
+--
+-- This uses multi-threading and always attempts to keep at least 10 batches in
+-- the queue. Additionally, all evaluation functions are run concurrently.
+cmaesOptimizeListWithBatches
+  :: forall m f training_batch
+   . (MonadIO m, Traversable f)
+  => f Double                    -- ^ Initial model
+  -> IO training_batch           -- ^ Generate a training batch of data.
+  -> (training_batch -> f Double -> IO Double)   -- ^ Fitness function.
+  -> CMAESConfiguration
+  -> m [(Double, f Double)]
+cmaesOptimizeListWithBatches initial_model batch_generator evaluate_fitness config
+  = liftIO $ mask $ \restore -> do
+    -- Queue for getting results out.
+    -- The contents: (sequence of (Double, f Double)], is_there_more_values_coming, exc)
+    output_queue <- liftIO $ atomically $ newTVar (Seq.empty, True, Nothing)
+
+    -- Launch off thread that will do all the work.
+    tid          <- liftIO $ forkIOWithUnmask $ \restore -> do
+      -- Handle exceptions, put them in 'output_queue'
+      exc <- try $ restore $ worker output_queue
+      case exc of
+        Left exc ->
+          atomically $ modifyTVar output_queue $ \(a, b, _) -> (a, b, Just exc)
+        Right{} -> return ()
+
+    -- Create a mule MVar that's only purpose is to attach a finalizer.
+    gc_killer_mvar <- liftIO $ newMVar ()
+    void $ mkWeakMVar gc_killer_mvar (throwTo tid KillSilently)
+
+    -- Return an unsafeInterleaveIO thing that will consume 'output_queue'
+    -- lazily.
+    liftIO $ restore $ unsafeInterleaveIO $ exhaust output_queue gc_killer_mvar
+ where
+  exhaust
+    :: TVar (Seq (Double, f Double), Bool, Maybe SomeException)
+    -> MVar ()
+    -> IO [(Double, f Double)]
+  exhaust output_queue gc_killer_mvar = do
+    touchMVar gc_killer_mvar
+    next_item <- atomically $ do
+      (sequence, more_values_coming, exc) <- readTVar output_queue
+      case exc of
+        Just some_exc -> throwSTM some_exc
+        _             -> return ()
+      case Seq.viewl sequence of
+        Seq.EmptyL -> if more_values_coming then retry else return Nothing
+        item Seq.:< rest_of_sequence -> do
+          writeTVar output_queue (rest_of_sequence, more_values_coming, exc)
+          return (Just item)
+    case next_item of
+      Nothing        -> return []
+      Just next_item -> (next_item :)
+        <$> unsafeInterleaveIO (exhaust output_queue gc_killer_mvar)
+
+  worker output_queue = do
+    -- Keep training batches in this queue.
+    -- Set up queue for batch
+    batch_queue <- atomically $ newTBQueue 10
+
+    -- Launch off thread that obtains batches.
+    withAsync (obtainBatches batch_queue) $ \batch_obtainer_async -> do
+      link batch_obtainer_async
+
+      first_batch <- grabNextBatch batch_queue
+      batch_tvar  <- newTVarIO first_batch
+
+      let init = (defaultInit initial_model (evaluator batch_tvar))
+            { iteration = grabNextBatch batch_queue
+                          >>= atomically
+                          .   writeTVar batch_tvar
+            }
+
+      lst <- cmaesOptimizeList' init config
+      for_ lst $ \(fitness, model) ->
+        atomically $ modifyTVar output_queue $ \(seq, more_values, exc) ->
+          (seq Seq.|> (fitness, model), more_values, exc)
+      atomically $ modifyTVar output_queue $ \(seq, _more_values, exc) ->
+        (seq, False, exc)
+
+  grabNextBatch batch_queue = atomically $ readTBQueue batch_queue
+
+  evaluator batch_tvar model = do
+    batch <- atomically $ readTVar batch_tvar
+    evaluate_fitness batch model
+
+  obtainBatches batch_queue = forever $ do
+    batch <- batch_generator
+    atomically $ writeTBQueue batch_queue batch
+
+
+{-# NOINLINE touchMVar #-}
+touchMVar :: MVar () -> IO ()
+touchMVar !mvar = do
+  v <- readMVar mvar
+  v `seq` return v
+
+-- | Combinator designed to use with `cmaesOptimizeList'` to pick out the best
 -- candidate.
+--
+-- It will wait until the list exhausts and then returns whatever candidate had
+-- highest score.
 pickBest :: (Monad m, Ord score) => m [(score, candidate)] -> m candidate
 pickBest list_of_candidates = do
   lst <- list_of_candidates
@@ -269,9 +394,3 @@ cmaesOptimizeList' cmaes_init cmaes_conf = liftIO $ mask_ $ do
         (v :) <$> unsafeInterleaveIO (go exc_ref lst_mvar finalizer farr last)
       (_, _, True) -> return []
       (_, _, _   ) -> error "impossible."
-
-lambdaSuggestion :: Traversable f => f a -> Int
-lambdaSuggestion model =
-  let num_params = length $ toList model
-  in  4 + floor (3 * log (fromIntegral num_params :: Double))
-
