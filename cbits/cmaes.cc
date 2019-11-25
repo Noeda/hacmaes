@@ -4,6 +4,8 @@
 #include "libcmaes/surrogates/rankingsvm.hpp"
 #include "libcmaes/surrogates/rsvm_surr_strategy.hpp"
 #include <stdint.h>
+#include <cstdio>
+#include <omp.h>
 
 using namespace libcmaes;
 
@@ -52,8 +54,8 @@ void cmaes_optimize(int use_surrogates, int algo, double* initial, double sigma,
     }
 
     CMAParameters<> cmaparams(x0, sigma, lambda);
-    cmaparams.set_algo(algo);
     cmaparams.set_mt_feval(true);
+    cmaparams.set_algo(algo);
 
     std::vector<double> out;
     if ( use_surrogates ) {

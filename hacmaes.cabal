@@ -19,7 +19,9 @@ library
   hs-source-dirs:      src
   ghc-options:         -Wall -fno-warn-name-shadowing
   c-sources:           cbits/cmaes.cc
-  cc-options:          -fno-rtti -std=c++11
+  cc-options:          -fno-rtti -std=c++11 -fopenmp
   extra-libraries:     cmaes
+                       gomp
+                       stdc++
   default-language:    Haskell2010
 

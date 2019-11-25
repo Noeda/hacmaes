@@ -4,4 +4,6 @@
 *.o
 *.swp
 *~
-
+dist-newstyle/
+dist/
+.ghc.environment*
